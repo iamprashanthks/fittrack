@@ -37995,7 +37995,9 @@ In order to be iterable, non-array objects must have a [Symbol.iterator]() metho
                                       Q((e) => ({
                                         ...e,
                                         targetWeight:
-                                          parseFloat(h.target.value) || 0,
+                                          h.target.value === ""
+                                            ? ""
+                                            : parseFloat(h.target.value),
                                       })),
                                     className:
                                       "mt-1.5 w-full h-11 rounded-[12px] bg-[#0A0E12] border border-[#232A31] px-3.5 text-[14px] font-medium outline-none focus:border-[#C6FF00]/30",
