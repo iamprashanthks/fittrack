@@ -37158,43 +37158,16 @@ In order to be iterable, non-array objects must have a [Symbol.iterator]() metho
       qT = () => [];
     function SX() {
       let [f, u] = K0.useState("home"),
-        [n, Q] = K0.useState(() => {
-          try {
-            let h = localStorage.getItem("fittrack_profile");
-            if (h) return JSON.parse(h);
-          } catch { }
-          return {
-            name: "",
-            age: "",
-            gender: "M",
-            height: "",
-            targetWeight: "",
-          };
+        [n, Q] = K0.useState({
+          name: "",
+          age: "",
+          gender: "M",
+          height: "",
+          targetWeight: "",
         }),
-        [J, Z] = K0.useState(() => {
-          try {
-            let h = localStorage.getItem("fittrack_weights");
-            if (h) {
-              let e = JSON.parse(h);
-              if (Array.isArray(e) && e.length) return e;
-            }
-          } catch { }
-          return [];
-        }),
-        [M, Y] = K0.useState(() => {
-          try {
-            let h = localStorage.getItem("fittrack_fasts");
-            if (h) return JSON.parse(h);
-          } catch { }
-          return [];
-        }),
-        [H, N] = K0.useState(() => {
-          try {
-            let h = localStorage.getItem("fittrack_active_fast");
-            if (h) return JSON.parse(h);
-          } catch { }
-          return null;
-        }),
+        [J, Z] = K0.useState([]),
+        [M, Y] = K0.useState([]),
+        [H, N] = K0.useState(null),
         [X, U] = K0.useState("Month"),
         [q, F] = K0.useState(!1),
         [K, E] = K0.useState(""),
@@ -37205,22 +37178,253 @@ In order to be iterable, non-array objects must have a [Symbol.iterator]() metho
         [L, S] = K0.useState(!1),
         [authUser, setAuthUser] = K0.useState(null),
         [authLoading, setAuthLoading] = K0.useState(!1);
+
+      let saveProfileTimeoutRef = K0.useRef(null);
+
+      let saveProfileToSupabase = async (prof, u = authUser) => {
+        let client = window.supabaseClient || (typeof supabaseClient !== "undefined" ? supabaseClient : null);
+        let currentUser = u || authUser;
+        if (!client || !currentUser) return;
+        try {
+          let payload = {
+            id: currentUser.id,
+            name: prof.name || null,
+            age: prof.age !== "" && prof.age !== null && prof.age !== undefined ? parseInt(prof.age, 10) : null,
+            gender: prof.gender || "M",
+            height_cm: prof.height !== "" && prof.height !== null && prof.height !== undefined ? parseFloat(prof.height) : null,
+            target_weight_kg: prof.targetWeight !== "" && prof.targetWeight !== null && prof.targetWeight !== undefined ? parseFloat(prof.targetWeight) : null,
+            updated_at: new Date().toISOString()
+          };
+          let { error: err } = await client.from("profiles").upsert(payload);
+          if (err && (err.code === "PGRST204" || (err.message && err.message.includes("gender")))) {
+            delete payload.gender;
+            let { error: err2 } = await client.from("profiles").upsert(payload);
+            if (err2) console.error("Error saving profile (fallback):", err2);
+          } else if (err) {
+            console.error("Error saving profile:", err);
+          }
+        } catch (err) {
+          console.error("Profile save exception:", err);
+        }
+      };
+
+      let updateProfileField = (field, value) => {
+        Q((prev) => {
+          let next = { ...prev, [field]: value };
+          if (saveProfileTimeoutRef.current) clearTimeout(saveProfileTimeoutRef.current);
+          saveProfileTimeoutRef.current = setTimeout(() => {
+            saveProfileToSupabase(next);
+          }, 400);
+          return next;
+        });
+      };
+
+      let performOneTimeMigration = async (client, user) => {
+        try {
+          let localProfileRaw = localStorage.getItem("fittrack_profile");
+          let localWeightsRaw = localStorage.getItem("fittrack_weights");
+          let localFastsRaw = localStorage.getItem("fittrack_fasts");
+          let localActiveRaw = localStorage.getItem("fittrack_active_fast");
+
+          if (localProfileRaw) {
+            let p = JSON.parse(localProfileRaw);
+            let payload = {
+              id: user.id,
+              name: p.name || null,
+              age: p.age ? parseInt(p.age, 10) : null,
+              gender: p.gender || "M",
+              height_cm: p.height ? parseFloat(p.height) : null,
+              target_weight_kg: p.targetWeight ? parseFloat(p.targetWeight) : null,
+              updated_at: new Date().toISOString()
+            };
+            let { error: pErr } = await client.from("profiles").upsert(payload);
+            if (pErr && (pErr.code === "PGRST204" || (pErr.message && pErr.message.includes("gender")))) {
+              delete payload.gender;
+              await client.from("profiles").upsert(payload);
+            }
+          }
+
+          if (localWeightsRaw) {
+            let weights = JSON.parse(localWeightsRaw);
+            if (Array.isArray(weights) && weights.length > 0) {
+              let weightRows = weights.map((w) => ({
+                user_id: user.id,
+                weight_kg: parseFloat(w.weight),
+                recorded_at: w.timestamp || new Date().toISOString()
+              }));
+              await client.from("weight_entries").insert(weightRows);
+            }
+          }
+
+          if (localFastsRaw) {
+            let fasts = JSON.parse(localFastsRaw);
+            if (Array.isArray(fasts) && fasts.length > 0) {
+              let fastRows = fasts.map((f) => ({
+                user_id: user.id,
+                started_at: f.startISO,
+                ended_at: f.endISO,
+                target_hours: f.targetHours,
+                fasting_type: f.type
+              }));
+              let { error: fErr } = await client.from("fasting_sessions").insert(fastRows);
+              if (fErr && (fErr.code === "PGRST204" || (fErr.message && fErr.message.includes("fasting_type")))) {
+                let fallbackRows = fastRows.map((r) => {
+                  let { fasting_type, ...rest } = r;
+                  return rest;
+                });
+                await client.from("fasting_sessions").insert(fallbackRows);
+              }
+            }
+          }
+
+          if (localActiveRaw) {
+            let active = JSON.parse(localActiveRaw);
+            if (active && active.startISO) {
+              let activeRow = {
+                user_id: user.id,
+                started_at: active.startISO,
+                ended_at: null,
+                target_hours: active.targetHours,
+                fasting_type: active.type
+              };
+              let { error: aErr } = await client.from("fasting_sessions").insert(activeRow);
+              if (aErr && (aErr.code === "PGRST204" || (aErr.message && aErr.message.includes("fasting_type")))) {
+                delete activeRow.fasting_type;
+                await client.from("fasting_sessions").insert(activeRow);
+              }
+            }
+          }
+        } catch (err) {
+          console.error("Migration error:", err);
+        }
+      };
+
+      let loadUserData = async (user) => {
+        let client = window.supabaseClient || (typeof supabaseClient !== "undefined" ? supabaseClient : null);
+        if (!client || !user) return;
+        try {
+          let migrationStatus = localStorage.getItem("fittrack_cloud_migration_v1");
+          let hasLocalData = localStorage.getItem("fittrack_profile") || localStorage.getItem("fittrack_weights") || localStorage.getItem("fittrack_fasts");
+
+          let { data: profileData } = await client
+            .from("profiles")
+            .select("*")
+            .eq("id", user.id)
+            .maybeSingle();
+
+          if (migrationStatus !== "completed" && hasLocalData && !profileData) {
+            console.log("Migrating local FitTrack data to Supabase...");
+            await performOneTimeMigration(client, user);
+            localStorage.setItem("fittrack_cloud_migration_v1", "completed");
+            localStorage.removeItem("fittrack_profile");
+            localStorage.removeItem("fittrack_weights");
+            localStorage.removeItem("fittrack_fasts");
+            localStorage.removeItem("fittrack_active_fast");
+
+            let { data: newProf } = await client.from("profiles").select("*").eq("id", user.id).maybeSingle();
+            profileData = newProf;
+          }
+
+          if (profileData) {
+            Q({
+              name: profileData.name || "",
+              age: profileData.age !== null && profileData.age !== undefined ? profileData.age : "",
+              gender: profileData.gender || "M",
+              height: profileData.height_cm !== null && profileData.height_cm !== undefined ? profileData.height_cm : "",
+              targetWeight: profileData.target_weight_kg !== null && profileData.target_weight_kg !== undefined ? profileData.target_weight_kg : ""
+            });
+          }
+
+          let { data: weightsData, error: weightsErr } = await client
+            .from("weight_entries")
+            .select("*")
+            .eq("user_id", user.id)
+            .order("recorded_at", { ascending: true });
+
+          if (!weightsErr && weightsData) {
+            let formattedWeights = weightsData.map((item) => ({
+              id: item.id,
+              weight: parseFloat(item.weight_kg),
+              timestamp: item.recorded_at
+            }));
+            Z(formattedWeights);
+          } else {
+            Z([]);
+          }
+
+          let { data: fastsData, error: fastsErr } = await client
+            .from("fasting_sessions")
+            .select("*")
+            .eq("user_id", user.id)
+            .not("ended_at", "is", null)
+            .order("started_at", { ascending: false });
+
+          if (!fastsErr && fastsData) {
+            let formattedFasts = fastsData.map((item) => {
+              let dur = (new Date(item.ended_at).getTime() - new Date(item.started_at).getTime()) / 1000;
+              return {
+                id: item.id,
+                startISO: item.started_at,
+                endISO: item.ended_at,
+                durationSec: Math.max(0, dur),
+                targetHours: parseFloat(item.target_hours) || 16,
+                type: item.fasting_type || `${item.target_hours}:${24 - (parseFloat(item.target_hours) || 16)}`
+              };
+            });
+            Y(formattedFasts);
+          } else {
+            Y([]);
+          }
+
+          let { data: activeFastData, error: activeErr } = await client
+            .from("fasting_sessions")
+            .select("*")
+            .eq("user_id", user.id)
+            .is("ended_at", null)
+            .order("started_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (!activeErr && activeFastData) {
+            N({
+              id: activeFastData.id,
+              startISO: activeFastData.started_at,
+              targetHours: parseFloat(activeFastData.target_hours) || 16,
+              type: activeFastData.fasting_type || `${activeFastData.target_hours}:${24 - (parseFloat(activeFastData.target_hours) || 16)}`
+            });
+          } else {
+            N(null);
+          }
+        } catch (err) {
+          console.error("Error loading user data from Supabase:", err);
+        }
+      };
+
       (K0.useEffect(() => {
         let client = window.supabaseClient || (typeof supabaseClient !== "undefined" ? supabaseClient : null);
         if (client) {
           client.auth.getSession().then(({ data: { session } }) => {
-            setAuthUser(session?.user ?? null);
-            if (session) {
-              console.log("Logged in:", session.user.email);
+            let u = session?.user ?? null;
+            setAuthUser(u);
+            if (u) {
+              console.log("Logged in:", u.email);
+              loadUserData(u);
             } else {
               console.log("Not logged in");
             }
           });
           let { data: { subscription } } = client.auth.onAuthStateChange((event, session) => {
             console.log("Auth event:", event);
-            setAuthUser(session?.user ?? null);
-            if (session) {
-              console.log("User:", session.user.email);
+            let u = session?.user ?? null;
+            setAuthUser(u);
+            if (u) {
+              console.log("User:", u.email);
+              loadUserData(u);
+            } else {
+              Q({ name: "", age: "", gender: "M", height: "", targetWeight: "" });
+              Z([]);
+              Y([]);
+              N(null);
             }
           });
           return () => subscription.unsubscribe();
@@ -37229,21 +37433,8 @@ In order to be iterable, non-array objects must have a [Symbol.iterator]() metho
         K0.useEffect(() => {
           let h = setInterval(() => W(Date.now()), 1000);
           return () => clearInterval(h);
-        }, []),
-        K0.useEffect(() => {
-          localStorage.setItem("fittrack_profile", JSON.stringify(n));
-        }, [n]),
-        K0.useEffect(() => {
-          localStorage.setItem("fittrack_weights", JSON.stringify(J));
-        }, [J]),
-        K0.useEffect(() => {
-          localStorage.setItem("fittrack_fasts", JSON.stringify(M));
-        }, [M]),
-        K0.useEffect(() => {
-          if (H)
-            localStorage.setItem("fittrack_active_fast", JSON.stringify(H));
-          else localStorage.removeItem("fittrack_active_fast");
-        }, [H]));
+        }, []));
+
       let handleGoogleSignIn = async () => {
         let client = window.supabaseClient || (typeof supabaseClient !== "undefined" ? supabaseClient : null);
         if (!client) {
@@ -37271,6 +37462,10 @@ In order to be iterable, non-array objects must have a [Symbol.iterator]() metho
             let { error: err } = await client.auth.signOut();
             if (err) throw err;
             setAuthUser(null);
+            Q({ name: "", age: "", gender: "M", height: "", targetWeight: "" });
+            Z([]);
+            Y([]);
+            N(null);
             c("Signed out");
           } catch (err) {
             c(err.message || "Sign out failed");
@@ -37370,58 +37565,142 @@ In order to be iterable, non-array objects must have a [Symbol.iterator]() metho
             N0 = Math.floor((h % 3600) / 60);
           return `${e}h ${N0}m`;
         },
-        j = (h) => {
+        j = async (h) => {
           if (H) return;
-          (N({
-            startISO: new Date().toISOString(),
-            targetHours: h.hours,
-            type: h.label,
-          }),
-            c(`Fasting started • ${h.label}`));
+          let client = window.supabaseClient || (typeof supabaseClient !== "undefined" ? supabaseClient : null);
+          if (client && authUser) {
+            try {
+              let startISO = new Date().toISOString();
+              let payload = {
+                user_id: authUser.id,
+                started_at: startISO,
+                ended_at: null,
+                target_hours: h.hours,
+                fasting_type: h.label
+              };
+              let { data: newRow, error: err } = await client
+                .from("fasting_sessions")
+                .insert(payload)
+                .select()
+                .single();
+
+              if (err && (err.code === "PGRST204" || (err.message && err.message.includes("fasting_type")))) {
+                delete payload.fasting_type;
+                let res = await client
+                  .from("fasting_sessions")
+                  .insert(payload)
+                  .select()
+                  .single();
+                newRow = res.data;
+                err = res.error;
+              }
+
+              if (err) throw err;
+
+              N({
+                id: newRow.id,
+                startISO: newRow.started_at,
+                targetHours: parseFloat(newRow.target_hours),
+                type: newRow.fasting_type || h.label
+              });
+              c(`Fasting started • ${h.label}`);
+            } catch (err) {
+              console.error("Error starting fast:", err);
+              c(err.message || "Failed to start fast");
+            }
+          } else {
+            c("Please log in to start fast");
+          }
         },
-        k = () => {
+        k = async () => {
           if (!H) return;
-          let h = new Date().toISOString(),
-            e =
-              (new Date(h).getTime() - new Date(H.startISO).getTime()) / 1000,
-            N0 = {
-              id: Date.now(),
-              startISO: H.startISO,
-              endISO: h,
-              durationSec: e,
-              targetHours: H.targetHours,
-              type: H.type,
-            };
-          (Y((X0) => [N0, ...X0].slice(0, 50)),
-            N(null),
-            c(`Fast completed • ${T(e)}`));
+          let client = window.supabaseClient || (typeof supabaseClient !== "undefined" ? supabaseClient : null);
+          let nowISO = new Date().toISOString();
+          let dur = (new Date(nowISO).getTime() - new Date(H.startISO).getTime()) / 1000;
+
+          if (client && authUser) {
+            try {
+              let query = client
+                .from("fasting_sessions")
+                .update({ ended_at: nowISO });
+
+              if (H.id) {
+                query = query.eq("id", H.id);
+              } else {
+                query = query.eq("user_id", authUser.id).is("ended_at", null);
+              }
+
+              let { error: err } = await query;
+              if (err) throw err;
+
+              let N0 = {
+                id: H.id || Date.now(),
+                startISO: H.startISO,
+                endISO: nowISO,
+                durationSec: dur,
+                targetHours: H.targetHours,
+                type: H.type
+              };
+
+              Y((X0) => [N0, ...X0].slice(0, 50));
+              N(null);
+              c(`Fast completed • ${T(dur)}`);
+            } catch (err) {
+              console.error("Error completing fast:", err);
+              c(err.message || "Failed to complete fast");
+            }
+          }
         },
         c = (h) => {
           (D(h), setTimeout(() => D(null), 2800));
         },
-        s = () => {
+        s = async () => {
           let h = parseFloat(K);
           if (isNaN(h) || h <= 0) {
             c("Enter valid weight");
             return;
           }
-          let e = V ? new Date(V).toISOString() : new Date().toISOString(),
-            N0 = {
-              id: Date.now(),
-              weight: parseFloat(h.toFixed(1)),
-              timestamp: e,
-            };
-          (Z((X0) =>
-            [...X0, N0].sort(
-              (y1, v1) =>
-                new Date(y1.timestamp).getTime() -
-                new Date(v1.timestamp).getTime(),
-            ),
-          ),
-            F(!1),
-            E(""),
-            G(""),
-            c(`Logged ${h.toFixed(1)} kg`));
+          let client = window.supabaseClient || (typeof supabaseClient !== "undefined" ? supabaseClient : null);
+          let e = V ? new Date(V).toISOString() : new Date().toISOString();
+
+          if (client && authUser) {
+            try {
+              let { data: newRow, error: err } = await client
+                .from("weight_entries")
+                .insert({
+                  user_id: authUser.id,
+                  weight_kg: parseFloat(h.toFixed(1)),
+                  recorded_at: e
+                })
+                .select()
+                .single();
+
+              if (err) throw err;
+
+              let N0 = {
+                id: newRow.id,
+                weight: parseFloat(newRow.weight_kg),
+                timestamp: newRow.recorded_at
+              };
+
+              Z((X0) =>
+                [...X0, N0].sort(
+                  (y1, v1) =>
+                    new Date(y1.timestamp).getTime() -
+                    new Date(v1.timestamp).getTime(),
+                ),
+              );
+              F(!1);
+              E("");
+              G("");
+              c(`Logged ${h.toFixed(1)} kg`);
+            } catch (err) {
+              console.error("Error logging weight:", err);
+              c(err.message || "Failed to log weight to cloud");
+            }
+          } else {
+            c("Please log in to save data");
+          }
         },
         a = () => {
           let h = new Date(),
@@ -37477,40 +37756,90 @@ In order to be iterable, non-array objects must have a [Symbol.iterator]() metho
           let e = h.target.files?.[0];
           if (!e) return;
           let N0 = new FileReader();
-          if (
-            ((N0.onload = () => {
-              try {
-                let X0 = JSON.parse(N0.result);
-                if (X0.profile) Q(X0.profile);
-                if (X0.weights) Z(X0.weights);
-                if (X0.fasts) Y(X0.fasts);
-                c("Data imported");
-              } catch {
-                c("Invalid JSON file");
+          N0.onload = async () => {
+            try {
+              let X0 = JSON.parse(N0.result);
+              let client = window.supabaseClient || (typeof supabaseClient !== "undefined" ? supabaseClient : null);
+              if (!client || !authUser) {
+                c("Must be logged in to import data");
+                return;
               }
-            }),
-              N0.readAsText(e),
-              w.current)
-          )
-            w.current.value = "";
+
+              if (X0.profile) {
+                await client.from("profiles").upsert({
+                  id: authUser.id,
+                  name: X0.profile.name || null,
+                  age: X0.profile.age ? parseInt(X0.profile.age, 10) : null,
+                  gender: X0.profile.gender || "M",
+                  height_cm: X0.profile.height ? parseFloat(X0.profile.height) : null,
+                  target_weight_kg: X0.profile.targetWeight ? parseFloat(X0.profile.targetWeight) : null,
+                  updated_at: new Date().toISOString()
+                });
+              }
+
+              if (Array.isArray(X0.weights) && X0.weights.length > 0) {
+                let weightRows = X0.weights.map((w) => ({
+                  user_id: authUser.id,
+                  weight_kg: parseFloat(w.weight),
+                  recorded_at: w.timestamp || new Date().toISOString()
+                }));
+                await client.from("weight_entries").insert(weightRows);
+              }
+
+              if (Array.isArray(X0.fasts) && X0.fasts.length > 0) {
+                let fastRows = X0.fasts.map((f) => ({
+                  user_id: authUser.id,
+                  started_at: f.startISO,
+                  ended_at: f.endISO,
+                  target_hours: f.targetHours,
+                  fasting_type: f.type
+                }));
+                await client.from("fasting_sessions").insert(fastRows);
+              }
+
+              await loadUserData(authUser);
+              c("Data imported to cloud");
+            } catch (err) {
+              console.error("Import error:", err);
+              c("Invalid JSON file or import failed");
+            }
+          };
+          N0.readAsText(e);
+          if (w.current) w.current.value = "";
         },
-        Y0 = () => {
-          (localStorage.removeItem("fittrack_profile"),
-            localStorage.removeItem("fittrack_weights"),
-            localStorage.removeItem("fittrack_fasts"),
-            localStorage.removeItem("fittrack_active_fast"),
-            Q({
-              name: "",
-              age: "",
-              gender: "M",
-              height: "",
-              targetWeight: "",
-            }),
-            Z([]),
-            Y([]),
-            N(null),
-            S(!1),
-            c("Data reset"));
+        Y0 = async () => {
+          let client = window.supabaseClient || (typeof supabaseClient !== "undefined" ? supabaseClient : null);
+          if (client && authUser) {
+            try {
+              await client.from("weight_entries").delete().eq("user_id", authUser.id);
+              await client.from("fasting_sessions").delete().eq("user_id", authUser.id);
+              await client.from("profiles").upsert({
+                id: authUser.id,
+                name: "",
+                age: null,
+                gender: "M",
+                height_cm: null,
+                target_weight_kg: null,
+                updated_at: new Date().toISOString()
+              });
+
+              Q({
+                name: "",
+                age: "",
+                gender: "M",
+                height: "",
+                targetWeight: "",
+              });
+              Z([]);
+              Y([]);
+              N(null);
+              S(!1);
+              c("Cloud data reset");
+            } catch (err) {
+              console.error("Error resetting data:", err);
+              c(err.message || "Failed to reset cloud data");
+            }
+          }
         },
         $0 = new Date().toLocaleDateString([], {
           weekday: "long",
@@ -38224,10 +38553,7 @@ In order to be iterable, non-array objects must have a [Symbol.iterator]() metho
                               m("input", {
                                 value: n.name,
                                 onChange: (h) =>
-                                  Q((e) => ({
-                                    ...e,
-                                    name: h.target.value,
-                                  })),
+                                  updateProfileField("name", h.target.value),
                                 className:
                                   "mt-1.5 w-full h-11 rounded-[12px] bg-[#0A0E12] border border-[#232A31] px-3.5 text-[14px] font-medium outline-none focus:border-[#C6FF00]/40 focus:ring-2 focus:ring-[#C6FF00]/10",
                                 placeholder: "Your name",
@@ -38245,17 +38571,16 @@ In order to be iterable, non-array objects must have a [Symbol.iterator]() metho
                                 type: "number",
                                 value: n.age,
                                 onChange: (h) =>
-                                  Q((e) => ({
-                                    ...e,
-                                    age:
-                                      h.target.value === ""
-                                        ? ""
-                                        : Math.max(
-                                          0,
-                                          parseInt(h.target.value, 10) ||
-                                          0,
-                                        ),
-                                  })),
+                                  updateProfileField(
+                                    "age",
+                                    h.target.value === ""
+                                      ? ""
+                                      : Math.max(
+                                        0,
+                                        parseInt(h.target.value, 10) ||
+                                        0,
+                                      ),
+                                  ),
                                 className:
                                   "mt-1.5 w-full h-11 rounded-[12px] bg-[#0A0E12] border border-[#232A31] px-3.5 text-[14px] font-medium outline-none focus:border-white/20",
                               }),
@@ -38276,7 +38601,7 @@ In order to be iterable, non-array objects must have a [Symbol.iterator]() metho
                                     "button",
                                     {
                                       onClick: () =>
-                                        Q((e) => ({ ...e, gender: h })),
+                                        updateProfileField("gender", h),
                                       className: `flex-1 h-8 rounded-[8px] text-[13px] font-bold transition-all ${n.gender === h ? "bg-white text-black" : "text-white/50 hover:text-white"}`,
                                       children:
                                         h === "M" ? "Male" : "Female",
@@ -38301,16 +38626,15 @@ In order to be iterable, non-array objects must have a [Symbol.iterator]() metho
                                 type: "number",
                                 value: n.height,
                                 onChange: (h) =>
-                                  Q((e) => ({
-                                    ...e,
-                                    height:
-                                      h.target.value === ""
-                                        ? ""
-                                        : Math.max(
-                                          0,
-                                          parseFloat(h.target.value) || 0,
-                                        ),
-                                  })),
+                                  updateProfileField(
+                                    "height",
+                                    h.target.value === ""
+                                      ? ""
+                                      : Math.max(
+                                        0,
+                                        parseFloat(h.target.value) || 0,
+                                      ),
+                                  ),
                                 className:
                                   "mt-1.5 w-full h-11 rounded-[12px] bg-[#0A0E12] border border-[#232A31] px-3.5 text-[14px] font-medium outline-none focus:border-white/20",
                               }),
@@ -38331,13 +38655,12 @@ In order to be iterable, non-array objects must have a [Symbol.iterator]() metho
                                 step: "0.1",
                                 value: n.targetWeight,
                                 onChange: (h) =>
-                                  Q((e) => ({
-                                    ...e,
-                                    targetWeight:
-                                      h.target.value === ""
-                                        ? ""
-                                        : parseFloat(h.target.value),
-                                  })),
+                                  updateProfileField(
+                                    "targetWeight",
+                                    h.target.value === ""
+                                      ? ""
+                                      : parseFloat(h.target.value),
+                                  ),
                                 className:
                                   "mt-1.5 w-full h-11 rounded-[12px] bg-[#0A0E12] border border-[#232A31] px-3.5 text-[14px] font-medium outline-none focus:border-[#C6FF00]/30",
                               }),
